@@ -6,8 +6,13 @@ namespace EpicFightJsonGeneratorApp.Services;
 
 public sealed class ItemModelScanner
 {
+    private const int MaxModelParentDepth = 20;
     private const string PrimaryHandheldParent = "minecraft:item/handheld";
     private const string LegacyHandheldParent = "item/handheld";
+    private const string TextureFoundStatus = "GUI model found, texture found";
+    private const string TextureMissingStatus = "GUI model found, texture missing";
+    private const string GuiModelMissingStatus = "GUI model missing";
+    private const string NoGuiParentStatus = "no perspectives.gui.parent";
 
     public async Task<IReadOnlyList<ItemModelInfo>> ScanHandheldItemsAsync(string selectedProjectPath)
     {
@@ -38,7 +43,7 @@ public sealed class ItemModelScanner
         }
 
         throw new DirectoryNotFoundException(
-            $"Resources folder was not found. Select the mod root folder, src/main/resources folder, or a .jar file.");
+            "Resources folder was not found. Select the mod root folder, src/main/resources folder, or a .jar file.");
     }
 
     private async Task<IReadOnlyList<ItemModelInfo>> ScanResourcesFolderAsync(string selectedProjectPath)
@@ -113,7 +118,9 @@ public sealed class ItemModelScanner
                 guiModel.ModelFilePath,
                 guiModel.TextureReference,
                 null,
-                guiModel.TextureBytes));
+                guiModel.TextureBytes,
+                guiModel.Status,
+                guiModel.Error));
         }
 
         if (items.Count == 0 && !HasAnyJarItemModelsFolder(archive))
@@ -157,7 +164,10 @@ public sealed class ItemModelScanner
                 guiModel.ModelReference,
                 guiModel.ModelFilePath,
                 guiModel.TextureReference,
-                guiModel.TextureFilePath));
+                guiModel.TextureFilePath,
+                null,
+                guiModel.Status,
+                guiModel.Error));
         }
 
         return result;
@@ -170,45 +180,75 @@ public sealed class ItemModelScanner
         string itemName,
         string? guiModelReference)
     {
-        string? resolvedModelReference = string.IsNullOrWhiteSpace(guiModelReference)
-            ? null
-            : guiModelReference.Trim();
+        bool hasExplicitGuiParent = !string.IsNullOrWhiteSpace(guiModelReference);
+        string? resolvedModelReference = hasExplicitGuiParent ? guiModelReference!.Trim() : null;
         string? modelFilePath = null;
         string modelNamespace = defaultNamespace;
 
-        if (!string.IsNullOrWhiteSpace(resolvedModelReference))
+        if (hasExplicitGuiParent)
         {
-            ResourceLocation modelLocation = ParseResourceLocation(resolvedModelReference, defaultNamespace);
+            ResourceLocation modelLocation = ParseResourceLocation(resolvedModelReference!, defaultNamespace);
             modelNamespace = modelLocation.Namespace;
-            modelFilePath = ResolveModelFilePath(resourcesFolder, modelLocation);
+            modelFilePath = FindModelFile(resourcesFolder, modelLocation);
         }
         else
         {
-            (resolvedModelReference, modelFilePath) = FindFallbackGuiModel(itemModelsFolder, itemName);
+            (resolvedModelReference, modelFilePath, modelNamespace) = FindFallbackGuiModel(
+                resourcesFolder,
+                itemModelsFolder,
+                defaultNamespace,
+                itemName);
         }
 
         if (string.IsNullOrWhiteSpace(modelFilePath) || !File.Exists(modelFilePath))
         {
-            return new GuiModelResolution(resolvedModelReference, modelFilePath, null, null, null);
+            string status = hasExplicitGuiParent ? GuiModelMissingStatus : NoGuiParentStatus;
+            string error = hasExplicitGuiParent ? "GUI model not found" : "No GUI parent in item model";
+            return new GuiModelResolution(resolvedModelReference, modelFilePath, null, null, null, status, error);
         }
 
         try
         {
-            await using FileStream stream = File.OpenRead(modelFilePath);
-            ItemModelData guiModelData = await ReadItemModelDataAsync(stream);
-            string? textureReference = guiModelData.Layer0TextureReference;
-            string? textureFilePath = ResolveTextureFilePath(resourcesFolder, textureReference, modelNamespace);
+            TextureResolution texture = await ResolveFileSystemTextureFromModelChainAsync(
+                resourcesFolder,
+                modelFilePath,
+                modelNamespace);
+
+            if (string.IsNullOrWhiteSpace(texture.Reference))
+            {
+                return new GuiModelResolution(
+                    resolvedModelReference,
+                    modelFilePath,
+                    null,
+                    null,
+                    null,
+                    TextureMissingStatus,
+                    "Texture not found");
+            }
+
+            string? textureFilePath = ResolveTextureFilePath(resourcesFolder, texture.Reference, texture.Namespace);
+            string status = textureFilePath is null ? TextureMissingStatus : TextureFoundStatus;
+            string? error = textureFilePath is null ? "Texture not found" : null;
 
             return new GuiModelResolution(
                 resolvedModelReference,
                 modelFilePath,
-                textureReference,
+                texture.Reference,
                 textureFilePath,
-                null);
+                null,
+                status,
+                error);
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
         {
-            return new GuiModelResolution(resolvedModelReference, modelFilePath, null, null, null);
+            return new GuiModelResolution(
+                resolvedModelReference,
+                modelFilePath,
+                null,
+                null,
+                null,
+                TextureMissingStatus,
+                ex.Message);
         }
     }
 
@@ -218,54 +258,227 @@ public sealed class ItemModelScanner
         string itemName,
         string? guiModelReference)
     {
-        string? resolvedModelReference = string.IsNullOrWhiteSpace(guiModelReference)
-            ? null
-            : guiModelReference.Trim();
+        bool hasExplicitGuiParent = !string.IsNullOrWhiteSpace(guiModelReference);
+        string? resolvedModelReference = hasExplicitGuiParent ? guiModelReference!.Trim() : null;
         string? modelEntryPath = null;
         string modelNamespace = defaultNamespace;
 
-        if (!string.IsNullOrWhiteSpace(resolvedModelReference))
+        if (hasExplicitGuiParent)
         {
-            ResourceLocation modelLocation = ParseResourceLocation(resolvedModelReference, defaultNamespace);
+            ResourceLocation modelLocation = ParseResourceLocation(resolvedModelReference!, defaultNamespace);
             modelNamespace = modelLocation.Namespace;
-            modelEntryPath = ResolveJarModelEntryPath(modelLocation);
+            modelEntryPath = FindJarModelEntryPath(archive, modelLocation);
         }
         else
         {
-            (resolvedModelReference, modelEntryPath) = FindFallbackJarGuiModel(archive, defaultNamespace, itemName);
+            (resolvedModelReference, modelEntryPath, modelNamespace) = FindFallbackJarGuiModel(
+                archive,
+                defaultNamespace,
+                itemName);
         }
 
         ZipArchiveEntry? modelEntry = string.IsNullOrWhiteSpace(modelEntryPath)
             ? null
-            : archive.GetEntry(modelEntryPath);
+            : GetEntryIgnoreCase(archive, modelEntryPath);
 
         if (modelEntry is null)
         {
-            return new GuiModelResolution(resolvedModelReference, modelEntryPath, null, null, null);
+            string status = hasExplicitGuiParent ? GuiModelMissingStatus : NoGuiParentStatus;
+            string error = hasExplicitGuiParent ? "GUI model not found" : "No GUI parent in item model";
+            return new GuiModelResolution(resolvedModelReference, modelEntryPath, null, null, null, status, error);
         }
 
         try
         {
-            await using Stream stream = modelEntry.Open();
-            ItemModelData guiModelData = await ReadItemModelDataAsync(stream);
-            string? textureReference = guiModelData.Layer0TextureReference;
-            byte[]? textureBytes = ResolveJarTextureBytes(archive, textureReference, modelNamespace);
+            TextureResolution texture = await ResolveJarTextureFromModelChainAsync(
+                archive,
+                modelEntry.FullName,
+                modelNamespace);
+
+            if (string.IsNullOrWhiteSpace(texture.Reference))
+            {
+                return new GuiModelResolution(
+                    resolvedModelReference,
+                    modelEntry.FullName,
+                    null,
+                    null,
+                    null,
+                    TextureMissingStatus,
+                    "Texture not found");
+            }
+
+            byte[]? textureBytes = ResolveJarTextureBytes(archive, texture.Reference, texture.Namespace);
+            string status = textureBytes is null ? TextureMissingStatus : TextureFoundStatus;
+            string? error = textureBytes is null ? "Texture not found" : null;
 
             return new GuiModelResolution(
                 resolvedModelReference,
-                modelEntryPath,
-                textureReference,
+                modelEntry.FullName,
+                texture.Reference,
                 null,
-                textureBytes);
+                textureBytes,
+                status,
+                error);
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
         {
-            return new GuiModelResolution(resolvedModelReference, modelEntryPath, null, null, null);
+            return new GuiModelResolution(
+                resolvedModelReference,
+                modelEntry.FullName,
+                null,
+                null,
+                null,
+                TextureMissingStatus,
+                ex.Message);
         }
     }
 
-    private static (string? ModelReference, string? ModelFilePath) FindFallbackGuiModel(
+    private static async Task<TextureResolution> ResolveFileSystemTextureFromModelChainAsync(
+        string resourcesFolder,
+        string startModelFilePath,
+        string startNamespace)
+    {
+        List<ModelChainEntry> chain = new();
+        HashSet<string> visitedModels = new(StringComparer.OrdinalIgnoreCase);
+        string? currentModelFilePath = startModelFilePath;
+        string currentNamespace = startNamespace;
+
+        for (int depth = 0; depth < MaxModelParentDepth && !string.IsNullOrWhiteSpace(currentModelFilePath); depth++)
+        {
+            string visitedKey = Path.GetFullPath(currentModelFilePath);
+            if (!visitedModels.Add(visitedKey) || !File.Exists(currentModelFilePath))
+            {
+                break;
+            }
+
+            await using FileStream stream = File.OpenRead(currentModelFilePath);
+            ItemModelData modelData = await ReadItemModelDataAsync(stream);
+            chain.Add(new ModelChainEntry(modelData, currentNamespace));
+
+            if (string.IsNullOrWhiteSpace(modelData.Parent) || IsTerminalParent(modelData.Parent))
+            {
+                break;
+            }
+
+            ResourceLocation parentLocation = ParseResourceLocation(modelData.Parent, currentNamespace);
+            string? parentFilePath = FindModelFile(resourcesFolder, parentLocation);
+            currentNamespace = InferNamespaceFromModelPath(resourcesFolder, parentFilePath) ?? parentLocation.Namespace;
+            currentModelFilePath = parentFilePath;
+        }
+
+        return ResolveTextureReferenceFromChain(chain);
+    }
+
+    private static async Task<TextureResolution> ResolveJarTextureFromModelChainAsync(
+        ZipArchive archive,
+        string startModelEntryPath,
+        string startNamespace)
+    {
+        List<ModelChainEntry> chain = new();
+        HashSet<string> visitedModels = new(StringComparer.OrdinalIgnoreCase);
+        string? currentModelEntryPath = startModelEntryPath;
+        string currentNamespace = startNamespace;
+
+        for (int depth = 0; depth < MaxModelParentDepth && !string.IsNullOrWhiteSpace(currentModelEntryPath); depth++)
+        {
+            ZipArchiveEntry? entry = GetEntryIgnoreCase(archive, currentModelEntryPath);
+            if (entry is null || !visitedModels.Add(entry.FullName))
+            {
+                break;
+            }
+
+            await using Stream stream = entry.Open();
+            ItemModelData modelData = await ReadItemModelDataAsync(stream);
+            chain.Add(new ModelChainEntry(modelData, currentNamespace));
+
+            if (string.IsNullOrWhiteSpace(modelData.Parent) || IsTerminalParent(modelData.Parent))
+            {
+                break;
+            }
+
+            ResourceLocation parentLocation = ParseResourceLocation(modelData.Parent, currentNamespace);
+            string? parentEntryPath = FindJarModelEntryPath(archive, parentLocation);
+            currentNamespace = InferNamespaceFromModelEntryPath(parentEntryPath) ?? parentLocation.Namespace;
+            currentModelEntryPath = parentEntryPath;
+        }
+
+        return ResolveTextureReferenceFromChain(chain);
+    }
+
+    private static TextureResolution ResolveTextureReferenceFromChain(IReadOnlyList<ModelChainEntry> chain)
+    {
+        if (chain.Count == 0)
+        {
+            return new TextureResolution(null, string.Empty);
+        }
+
+        Dictionary<string, TextureValue> mergedTextures = new(StringComparer.OrdinalIgnoreCase);
+        for (int index = chain.Count - 1; index >= 0; index--)
+        {
+            foreach ((string key, string value) in chain[index].Data.Textures)
+            {
+                mergedTextures[key] = new TextureValue(value, chain[index].Namespace);
+            }
+        }
+
+        TextureValue? textureValue = ReadPreferredTextureValue(mergedTextures);
+        return ResolveTextureVariable(textureValue, mergedTextures);
+    }
+
+    private static TextureValue? ReadPreferredTextureValue(IReadOnlyDictionary<string, TextureValue> textures)
+    {
+        foreach (string key in new[] { "layer0", "0", "particle" })
+        {
+            if (textures.TryGetValue(key, out TextureValue? value) && !string.IsNullOrWhiteSpace(value.Reference))
+            {
+                return value;
+            }
+        }
+
+        foreach (TextureValue value in textures.Values)
+        {
+            if (!string.IsNullOrWhiteSpace(value.Reference))
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private static TextureResolution ResolveTextureVariable(
+        TextureValue? textureValue,
+        IReadOnlyDictionary<string, TextureValue> textures)
+    {
+        TextureValue? resolvedValue = textureValue;
+        HashSet<string> visitedKeys = new(StringComparer.OrdinalIgnoreCase);
+
+        for (int depth = 0; depth < MaxModelParentDepth; depth++)
+        {
+            if (resolvedValue is null || string.IsNullOrWhiteSpace(resolvedValue.Reference))
+            {
+                return new TextureResolution(null, string.Empty);
+            }
+
+            if (!resolvedValue.Reference.StartsWith('#'))
+            {
+                return new TextureResolution(resolvedValue.Reference, resolvedValue.Namespace);
+            }
+
+            string key = resolvedValue.Reference[1..];
+            if (!visitedKeys.Add(key) || !textures.TryGetValue(key, out resolvedValue))
+            {
+                return new TextureResolution(null, string.Empty);
+            }
+        }
+
+        return new TextureResolution(null, string.Empty);
+    }
+
+    private static (string? ModelReference, string? ModelFilePath, string ModelNamespace) FindFallbackGuiModel(
+        string resourcesFolder,
         string itemModelsFolder,
+        string defaultNamespace,
         string itemName)
     {
         foreach (string candidateName in GetGuiModelCandidates(itemName))
@@ -273,14 +486,20 @@ public sealed class ItemModelScanner
             string candidatePath = Path.Combine(itemModelsFolder, $"{candidateName}.json");
             if (File.Exists(candidatePath))
             {
-                return (candidateName, candidatePath);
+                return (candidateName, candidatePath, defaultNamespace);
+            }
+
+            string? fallbackPath = FindModelFileByFileName(resourcesFolder, $"{candidateName}.json");
+            if (!string.IsNullOrWhiteSpace(fallbackPath))
+            {
+                return (candidateName, fallbackPath, InferNamespaceFromModelPath(resourcesFolder, fallbackPath) ?? defaultNamespace);
             }
         }
 
-        return (null, null);
+        return (null, null, defaultNamespace);
     }
 
-    private static (string? ModelReference, string? ModelEntryPath) FindFallbackJarGuiModel(
+    private static (string? ModelReference, string? ModelEntryPath, string ModelNamespace) FindFallbackJarGuiModel(
         ZipArchive archive,
         string modId,
         string itemName)
@@ -288,19 +507,31 @@ public sealed class ItemModelScanner
         foreach (string candidateName in GetGuiModelCandidates(itemName))
         {
             string candidateEntryPath = $"assets/{modId}/models/item/{candidateName}.json";
-            if (archive.GetEntry(candidateEntryPath) is not null)
+            ZipArchiveEntry? candidateEntry = GetEntryIgnoreCase(archive, candidateEntryPath);
+            if (candidateEntry is not null)
             {
-                return (candidateName, candidateEntryPath);
+                return (candidateName, candidateEntry.FullName, modId);
+            }
+
+            ZipArchiveEntry? fallbackEntry = FindJarModelEntryByFileName(archive, $"{candidateName}.json");
+            if (fallbackEntry is not null)
+            {
+                return (candidateName, fallbackEntry.FullName, InferNamespaceFromModelEntryPath(fallbackEntry.FullName) ?? modId);
             }
         }
 
-        return (null, null);
+        return (null, null, modId);
     }
 
     private static IEnumerable<string> GetGuiModelCandidates(string itemName)
     {
         yield return $"{itemName}_gui";
         yield return $"{itemName}gui";
+        yield return itemName;
+        yield return $"{itemName}_2d";
+        yield return $"{itemName}_2d_gui";
+        yield return $"{itemName}_inventory";
+        yield return $"{itemName}_icon";
     }
 
     private static async Task<ItemModelData> ReadItemModelDataAsync(Stream jsonStream)
@@ -319,14 +550,24 @@ public sealed class ItemModelScanner
             guiModelReference = ReadStringProperty(guiElement, "parent");
         }
 
-        string? layer0TextureReference = null;
+        Dictionary<string, string> textures = new(StringComparer.OrdinalIgnoreCase);
         if (root.TryGetProperty("textures", out JsonElement texturesElement)
             && texturesElement.ValueKind == JsonValueKind.Object)
         {
-            layer0TextureReference = ReadStringProperty(texturesElement, "layer0");
+            foreach (JsonProperty textureProperty in texturesElement.EnumerateObject())
+            {
+                if (textureProperty.Value.ValueKind == JsonValueKind.String)
+                {
+                    string? value = textureProperty.Value.GetString();
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        textures[textureProperty.Name] = value;
+                    }
+                }
+            }
         }
 
-        return new ItemModelData(parent, guiModelReference, layer0TextureReference);
+        return new ItemModelData(parent, guiModelReference, textures);
     }
 
     private static string? ReadStringProperty(JsonElement element, string propertyName)
@@ -340,6 +581,14 @@ public sealed class ItemModelScanner
     private static bool IsHandheldParent(string? parent)
     {
         return string.Equals(parent, PrimaryHandheldParent, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(parent, LegacyHandheldParent, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsTerminalParent(string parent)
+    {
+        return string.Equals(parent, "minecraft:item/generated", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(parent, "item/generated", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(parent, PrimaryHandheldParent, StringComparison.OrdinalIgnoreCase)
             || string.Equals(parent, LegacyHandheldParent, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -369,7 +618,12 @@ public sealed class ItemModelScanner
             "textures",
             ToPlatformPath(textureLocation.Path) + ".png");
 
-        return File.Exists(texturePath) ? texturePath : null;
+        if (File.Exists(texturePath))
+        {
+            return texturePath;
+        }
+
+        return FindTextureFileByFileName(resourcesFolder, $"{Path.GetFileName(textureLocation.Path)}.png");
     }
 
     private static byte[]? ResolveJarTextureBytes(
@@ -384,7 +638,9 @@ public sealed class ItemModelScanner
 
         ResourceLocation textureLocation = ParseResourceLocation(textureReference, defaultNamespace);
         string textureEntryPath = $"assets/{textureLocation.Namespace}/textures/{textureLocation.Path}.png";
-        ZipArchiveEntry? textureEntry = archive.GetEntry(textureEntryPath);
+        ZipArchiveEntry? textureEntry = GetEntryIgnoreCase(archive, textureEntryPath)
+            ?? FindJarTextureEntryByFileName(archive, $"{Path.GetFileName(textureLocation.Path)}.png");
+
         if (textureEntry is null)
         {
             return null;
@@ -394,6 +650,17 @@ public sealed class ItemModelScanner
         using Stream entryStream = textureEntry.Open();
         entryStream.CopyTo(memoryStream);
         return memoryStream.ToArray();
+    }
+
+    private static string? FindModelFile(string resourcesFolder, ResourceLocation modelLocation)
+    {
+        string modelFilePath = ResolveModelFilePath(resourcesFolder, modelLocation);
+        if (File.Exists(modelFilePath))
+        {
+            return modelFilePath;
+        }
+
+        return FindModelFileByFileName(resourcesFolder, $"{Path.GetFileName(modelLocation.Path)}.json");
     }
 
     private static string ResolveModelFilePath(string resourcesFolder, ResourceLocation modelLocation)
@@ -406,9 +673,62 @@ public sealed class ItemModelScanner
             ToPlatformPath(modelLocation.Path) + ".json");
     }
 
-    private static string ResolveJarModelEntryPath(ResourceLocation modelLocation)
+    private static string? FindModelFileByFileName(string resourcesFolder, string fileName)
     {
-        return $"assets/{modelLocation.Namespace}/models/{modelLocation.Path}.json";
+        string assetsFolder = Path.Combine(resourcesFolder, "assets");
+        if (!Directory.Exists(assetsFolder))
+        {
+            return null;
+        }
+
+        return Directory
+            .EnumerateFiles(assetsFolder, "*.json", SearchOption.AllDirectories)
+            .FirstOrDefault(path =>
+                path.Contains($"{Path.DirectorySeparatorChar}models{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(Path.GetFileName(path), fileName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string? FindTextureFileByFileName(string resourcesFolder, string fileName)
+    {
+        string assetsFolder = Path.Combine(resourcesFolder, "assets");
+        if (!Directory.Exists(assetsFolder))
+        {
+            return null;
+        }
+
+        return Directory
+            .EnumerateFiles(assetsFolder, "*.png", SearchOption.AllDirectories)
+            .FirstOrDefault(path =>
+                path.Contains($"{Path.DirectorySeparatorChar}textures{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(Path.GetFileName(path), fileName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string? FindJarModelEntryPath(ZipArchive archive, ResourceLocation modelLocation)
+    {
+        string modelEntryPath = $"assets/{modelLocation.Namespace}/models/{modelLocation.Path}.json";
+        ZipArchiveEntry? modelEntry = GetEntryIgnoreCase(archive, modelEntryPath);
+        return modelEntry?.FullName
+            ?? FindJarModelEntryByFileName(archive, $"{Path.GetFileName(modelLocation.Path)}.json")?.FullName;
+    }
+
+    private static ZipArchiveEntry? FindJarModelEntryByFileName(ZipArchive archive, string fileName)
+    {
+        return archive.Entries.FirstOrDefault(entry =>
+            entry.FullName.Contains("/models/", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(Path.GetFileName(entry.FullName), fileName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static ZipArchiveEntry? FindJarTextureEntryByFileName(ZipArchive archive, string fileName)
+    {
+        return archive.Entries.FirstOrDefault(entry =>
+            entry.FullName.Contains("/textures/", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(Path.GetFileName(entry.FullName), fileName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static ZipArchiveEntry? GetEntryIgnoreCase(ZipArchive archive, string entryPath)
+    {
+        return archive.GetEntry(entryPath)
+            ?? archive.Entries.FirstOrDefault(entry => string.Equals(entry.FullName, entryPath, StringComparison.OrdinalIgnoreCase));
     }
 
     private static ResourceLocation ParseResourceLocation(string reference, string defaultNamespace)
@@ -425,6 +745,39 @@ public sealed class ItemModelScanner
         string resourcePath = trimmedReference[(separatorIndex + 1)..];
 
         return new ResourceLocation(namespaceName, resourcePath);
+    }
+
+    private static string? InferNamespaceFromModelPath(string resourcesFolder, string? modelPath)
+    {
+        if (string.IsNullOrWhiteSpace(modelPath))
+        {
+            return null;
+        }
+
+        string assetsFolder = Path.Combine(resourcesFolder, "assets") + Path.DirectorySeparatorChar;
+        string fullAssetsFolder = Path.GetFullPath(assetsFolder);
+        string fullModelPath = Path.GetFullPath(modelPath);
+
+        if (!fullModelPath.StartsWith(fullAssetsFolder, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        string relativePath = fullModelPath[fullAssetsFolder.Length..];
+        return relativePath.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+    }
+
+    private static string? InferNamespaceFromModelEntryPath(string? entryPath)
+    {
+        if (string.IsNullOrWhiteSpace(entryPath))
+        {
+            return null;
+        }
+
+        string[] parts = entryPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length >= 2 && string.Equals(parts[0], "assets", StringComparison.OrdinalIgnoreCase)
+            ? parts[1]
+            : null;
     }
 
     private static string ToPlatformPath(string resourcePath)
@@ -485,14 +838,22 @@ public sealed class ItemModelScanner
     private sealed record ItemModelData(
         string? Parent,
         string? GuiModelReference,
-        string? Layer0TextureReference);
+        IReadOnlyDictionary<string, string> Textures);
+
+    private sealed record ModelChainEntry(ItemModelData Data, string Namespace);
+
+    private sealed record TextureValue(string Reference, string Namespace);
 
     private sealed record GuiModelResolution(
         string? ModelReference,
         string? ModelFilePath,
         string? TextureReference,
         string? TextureFilePath,
-        byte[]? TextureBytes);
+        byte[]? TextureBytes,
+        string Status,
+        string? Error);
+
+    private sealed record TextureResolution(string? Reference, string Namespace);
 
     private readonly record struct ResourceLocation(string Namespace, string Path);
 }

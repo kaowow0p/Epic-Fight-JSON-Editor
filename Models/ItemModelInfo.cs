@@ -11,7 +11,9 @@ public sealed class ItemModelInfo
         string? guiModelFilePath,
         string? guiTextureReference,
         string? guiTextureFilePath,
-        byte[]? guiTextureBytes = null)
+        byte[]? guiTextureBytes,
+        string guiResolveStatus,
+        string? guiResolveError)
     {
         ItemName = itemName;
         FilePath = filePath;
@@ -22,6 +24,8 @@ public sealed class ItemModelInfo
         GuiTextureReference = guiTextureReference;
         GuiTextureFilePath = guiTextureFilePath;
         GuiTextureBytes = guiTextureBytes;
+        GuiResolveStatus = guiResolveStatus;
+        GuiResolveError = guiResolveError;
     }
 
     public string ItemName { get; }
@@ -41,6 +45,10 @@ public sealed class ItemModelInfo
     public string? GuiTextureFilePath { get; }
 
     public byte[]? GuiTextureBytes { get; }
+
+    public string GuiResolveStatus { get; }
+
+    public string? GuiResolveError { get; }
 
     public override string ToString()
     {

@@ -452,7 +452,7 @@ public sealed class MainForm : Form
         _itemNameTextBox.Text = selectedItem.ItemName;
         _guiPreviewGroupBox.Text = $"GUI Preview - {GetGuiModelDisplayName(selectedItem.GuiModelReference)}";
         SuggestOutputFolder(selectedItem);
-        SetPreviewImage(selectedItem.GuiTextureFilePath, selectedItem.GuiTextureBytes);
+        SetPreviewImage(selectedItem.GuiTextureFilePath, selectedItem.GuiTextureBytes, GetPreviewMissingMessage(selectedItem));
     }
 
     private async void CreateButton_Click(object? sender, EventArgs e)
@@ -553,7 +553,7 @@ public sealed class MainForm : Form
     {
         _itemNameTextBox.Clear();
         _guiPreviewGroupBox.Text = "GUI Preview - not found";
-        SetPreviewImage(null, null);
+        SetPreviewImage(null, null, "Preview not found");
     }
 
     private static string GetGuiModelDisplayName(string? guiModelReference)
@@ -571,7 +571,27 @@ public sealed class MainForm : Form
             : normalizedReference[(normalizedReference.LastIndexOf(':') + 1)..];
     }
 
-    private void SetPreviewImage(string? imagePath, byte[]? imageBytes)
+    private static string GetPreviewMissingMessage(ItemModelInfo selectedItem)
+    {
+        if (string.Equals(selectedItem.GuiResolveStatus, "GUI model missing", StringComparison.OrdinalIgnoreCase))
+        {
+            return "GUI model not found";
+        }
+
+        if (string.Equals(selectedItem.GuiResolveStatus, "no perspectives.gui.parent", StringComparison.OrdinalIgnoreCase))
+        {
+            return "No GUI parent in item model";
+        }
+
+        if (string.Equals(selectedItem.GuiResolveStatus, "GUI model found, texture missing", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Texture not found";
+        }
+
+        return selectedItem.GuiResolveError ?? "Preview not found";
+    }
+
+    private void SetPreviewImage(string? imagePath, byte[]? imageBytes, string missingMessage)
     {
         Image? previousImage = _guiPreviewPictureBox.Image;
         _guiPreviewPictureBox.Image = null;
@@ -584,7 +604,7 @@ public sealed class MainForm : Form
 
         if (!hasImageBytes && !hasImageFile)
         {
-            _previewStatusLabel.Text = "Preview not found";
+            _previewStatusLabel.Text = missingMessage;
             _previewStatusLabel.Visible = true;
             return;
         }
@@ -604,7 +624,7 @@ public sealed class MainForm : Form
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
-            _previewStatusLabel.Text = "Preview not found";
+            _previewStatusLabel.Text = "Texture found but image failed to load";
             _previewStatusLabel.Visible = true;
         }
     }
