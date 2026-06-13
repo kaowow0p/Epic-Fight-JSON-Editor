@@ -77,7 +77,7 @@ public sealed class MainForm : Form
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-        Button browseProjectButton = new() { Text = "Browse Folder...", AutoSize = true };
+        Button browseProjectButton = new() { Text = "Browse", AutoSize = true };
         browseProjectButton.Click += BrowseProjectButton_Click;
 
         Button browseJarButton = new() { Text = "Browse JAR...", AutoSize = true };
